@@ -1,0 +1,335 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>可话记忆胶囊 - 极速版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; overflow: hidden; background-color: #f5f5f5; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-thumb { background: #c1c1c1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #a8a8a8; }
+        ::-webkit-scrollbar-track { background: transparent; }
+
+        .bubble-left::before {
+            content: ""; position: absolute; left: -10px; top: 10px;
+            border-top: 6px solid transparent; border-bottom: 6px solid transparent;
+            border-right: 10px solid white;
+        }
+        .bubble-right::before {
+            content: ""; position: absolute; right: -10px; top: 10px;
+            border-top: 6px solid transparent; border-bottom: 6px solid transparent;
+            border-left: 10px solid #95ec69;
+        }
+        .recalled-bubble { opacity: 0.7; }
+        
+        @keyframes flash-bg {
+            0% { background-color: #e0f2fe; }
+            100% { background-color: transparent; }
+        }
+        .jump-highlight {
+            animation: flash-bg 2s ease-out;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useRef, useEffect, useLayoutEffect } = React;
+
+        // 图标组件
+        const UserIcon = () => (
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        );
+        const XIcon = () => (
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        );
+
+        // 估算每条消息的平均高度，用于虚拟滚动计算
+        const ITEM_HEIGHT = 80; 
+        // 每次渲染的缓冲区大小（条数）
+        const BUFFER_SIZE = 20;
+
+        function App() {
+            const [messages, setMessages] = useState([]);
+            const [searchTerm, setSearchTerm] = useState("");
+            const [dateInput, setDateInput] = useState("");
+            const [fileName, setFileName] = useState("");
+            
+            // 虚拟滚动核心状态
+            const [scrollTop, setScrollTop] = useState(0);
+            const scrollContainerRef = useRef(null);
+            
+            const [highlightId, setHighlightId] = useState(null);
+
+            const handleFileUpload = (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+                setFileName(file.name);
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = JSON.parse(e.target.result);
+                        setMessages(data);
+                    } catch (error) { alert("文件格式错误"); }
+                };
+                reader.readAsText(file, "UTF-8");
+            };
+
+            // 过滤逻辑
+            const filteredMessages = useMemo(() => {
+                if (!searchTerm) return messages;
+                return messages.filter(msg => 
+                    msg.content && String(msg.content).toLowerCase().includes(searchTerm.toLowerCase())
+                );
+            }, [messages, searchTerm]);
+
+            // === 核心逻辑：虚拟列表计算 ===
+            
+            // 1. 计算总高度（撑开滚动条）
+            const totalHeight = filteredMessages.length * ITEM_HEIGHT;
+
+            // 2. 根据当前的滚动位置，计算应该显示哪一部分数据
+            const { startIndex, endIndex, visibleData, offsetY } = useMemo(() => {
+                const containerHeight = window.innerHeight; // 视口高度
+                
+                // 起始索引：滚动的距离 / 单项高度 - 缓冲区
+                let start = Math.floor(scrollTop / ITEM_HEIGHT) - BUFFER_SIZE;
+                start = Math.max(0, start);
+
+                // 结束索引：(滚动的距离 + 视口高度) / 单项高度 + 缓冲区
+                let end = Math.floor((scrollTop + containerHeight) / ITEM_HEIGHT) + BUFFER_SIZE;
+                end = Math.min(filteredMessages.length, end);
+
+                // 切割数据
+                const visible = filteredMessages.slice(start, end);
+                
+                // 计算上方空白区域的高度，用于 transform translateY
+                const offset = start * ITEM_HEIGHT;
+
+                return { 
+                    startIndex: start, 
+                    endIndex: end, 
+                    visibleData: visible,
+                    offsetY: offset
+                };
+            }, [scrollTop, filteredMessages]);
+
+
+            // === 核心逻辑：日期跳转 ===
+            const jumpToDate = (targetDate) => {
+                setDateInput(targetDate);
+                if (!targetDate) return;
+
+                const targetIndex = filteredMessages.findIndex(m => m.date >= targetDate);
+
+                if (targetIndex !== -1) {
+                    // 直接算出这个索引对应的像素高度
+                    const targetScrollTop = targetIndex * ITEM_HEIGHT;
+                    
+                    // 让容器滚动到那个位置
+                    if (scrollContainerRef.current) {
+                        scrollContainerRef.current.scrollTop = targetScrollTop;
+                    }
+
+                    // 设置高亮
+                    setHighlightId(filteredMessages[targetIndex].id || targetIndex);
+                } else {
+                    alert("该日期之后没有相关记录");
+                }
+            };
+
+            // 监听滚动事件，更新 scrollTop 状态
+            const onScroll = (e) => {
+                // 使用 requestAnimationFrame 节流，保证平滑
+                requestAnimationFrame(() => {
+                    setScrollTop(e.target.scrollTop);
+                });
+            };
+
+            // 当搜索结果变化时，重置滚动条
+            useEffect(() => {
+                if (searchTerm && scrollContainerRef.current) {
+                    scrollContainerRef.current.scrollTop = 0;
+                }
+            }, [searchTerm]);
+
+            const stats = useMemo(() => {
+                const myCount = filteredMessages.filter(m => m.isMe).length;
+                return { total: filteredMessages.length, me: myCount, peer: filteredMessages.length - myCount };
+            }, [filteredMessages]);
+
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            }, []);
+
+            return (
+                <div className="flex w-screen h-screen bg-[#f5f5f5]">
+                    {/* 左侧控制面板 */}
+                    <div className="w-80 bg-white border-r border-gray-200 flex flex-col flex-shrink-0 z-20 shadow-sm">
+                        <div className="h-16 flex items-center px-6 border-b border-gray-100">
+                            <h1 className="text-xl font-bold text-gray-800 flex items-center gap-2">
+                                <i data-lucide="message-circle" className="text-blue-500"></i>
+                                时光胶囊
+                            </h1>
+                        </div>
+                        <div className="p-4 space-y-4 flex-1 overflow-y-auto">
+                            <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 text-center hover:bg-blue-100 transition cursor-pointer relative group">
+                                <input type="file" accept=".json" onChange={handleFileUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
+                                <div className="flex flex-col items-center gap-2 text-blue-600">
+                                    <i data-lucide="file-json" className="w-8 h-8"></i>
+                                    <span className="font-medium text-sm">{fileName ? "已加载: " + fileName : "导入 chat_data.json"}</span>
+                                </div>
+                            </div>
+                            
+                            <div className="relative">
+                                <i data-lucide="search" className="absolute left-3 top-2.5 w-4 h-4 text-gray-400"></i>
+                                <input type="text" className="w-full bg-gray-50 border border-gray-200 rounded-lg pl-9 pr-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none" placeholder="搜索内容..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
+                            </div>
+
+                            <div className="space-y-1">
+                                <label className="text-xs font-semibold text-gray-400 uppercase">跳转至日期</label>
+                                <div className="flex items-center gap-2">
+                                    <input 
+                                        type="date" 
+                                        min="2020-01-01" 
+                                        className="flex-1 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer" 
+                                        value={dateInput} 
+                                        onChange={(e) => jumpToDate(e.target.value)} 
+                                    />
+                                    {dateInput && (
+                                        <button onClick={() => setDateInput("")} className="p-2 bg-gray-100 hover:bg-red-50 text-gray-500 hover:text-red-500 rounded-lg transition" title="清除日期"><XIcon /></button>
+                                    )}
+                                </div>
+                            </div>
+                            
+                            {messages.length > 0 && (
+                                <div className="bg-gray-50 rounded-xl p-4 border border-gray-200">
+                                    <div className="text-xs font-semibold text-gray-400 mb-2 uppercase">统计</div>
+                                    <div className="flex justify-between items-center text-sm">
+                                        <span className="text-gray-600">总条数</span>
+                                        <span className="font-bold text-gray-800">{filteredMessages.length}</span>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* 右侧聊天区域 */}
+                    <div className="flex-1 flex flex-col h-full bg-[#f5f5f5] relative min-w-0">
+                        <div className="h-16 bg-[#f5f5f5] border-b border-gray-200 flex items-center justify-between px-6 shrink-0 z-10">
+                            <div className="font-bold text-gray-700 text-lg">
+                                {messages.length > 0 ? (searchTerm ? "搜索结果" : "聊天记录") : "等待数据..."}
+                            </div>
+                            {messages.length > 0 && (
+                                <div className="text-xs text-gray-400 bg-gray-200 px-3 py-1 rounded-full">
+                                    当前视窗: {startIndex + 1} - {endIndex}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* 滚动容器 */}
+                        <div 
+                            className="flex-1 overflow-y-auto relative will-change-scroll" 
+                            ref={scrollContainerRef} 
+                            onScroll={onScroll}
+                        >
+                            {messages.length === 0 && !fileName && (
+                                <div className="h-full flex flex-col items-center justify-center text-gray-300 gap-4">
+                                    <p>请在左侧加载 JSON 文件</p>
+                                </div>
+                            )}
+
+                            {/* 虚拟滚动占位撑开高度 */}
+                            <div style={{ height: totalHeight, position: 'relative' }}>
+                                {/* 实际渲染的区域，使用绝对定位偏移 */}
+                                <div style={{ 
+                                    position: 'absolute', 
+                                    top: 0, 
+                                    left: 0, 
+                                    width: '100%', 
+                                    transform: `translateY(${offsetY}px)`,
+                                    padding: '20px 32px' // p-4 sm:p-8 转换
+                                }}>
+                                    {visibleData.map((msg, localIndex) => {
+                                        // 真正的索引是 startIndex + 当前map的index
+                                        const realIndex = startIndex + localIndex;
+                                        
+                                        // 重新计算日期显示逻辑：如果是当前视窗的第一条，或者和上一条真实数据的日期不同
+                                        const prevMsg = filteredMessages[realIndex - 1];
+                                        const showDate = realIndex === 0 || (prevMsg && prevMsg.date !== msg.date);
+                                        
+                                        const isHighlighted = (msg.id || realIndex) === highlightId;
+
+                                        return (
+                                            <React.Fragment key={msg.id || realIndex}>
+                                                {showDate && (
+                                                    <div className="flex justify-center my-4">
+                                                        <span className="text-xs text-gray-400 bg-gray-200 px-2 py-1 rounded">{msg.date}</span>
+                                                    </div>
+                                                )}
+
+                                                <div 
+                                                    className={`flex w-full mb-6 transition-colors duration-500 ${msg.isMe ? 'justify-end' : 'justify-start'} ${isHighlighted ? 'jump-highlight' : ''}`}
+                                                >
+                                                    {!msg.isMe && (
+                                                        <div className="w-9 h-9 rounded bg-white flex items-center justify-center text-gray-400 mr-3 flex-shrink-0 shadow-sm border border-gray-100">
+                                                            <UserIcon />
+                                                        </div>
+                                                    )}
+
+                                                    <div className={`flex flex-col max-w-[70%] sm:max-w-[60%] ${msg.isMe ? 'items-end' : 'items-start'}`}>
+                                                        
+                                                        <div className={`flex items-end gap-2 ${msg.isMe ? 'flex-row-reverse' : 'flex-row'}`}>
+                                                            
+                                                            <div className={`
+                                                                relative px-4 py-2.5 rounded-lg shadow-sm text-[15px] leading-relaxed break-words whitespace-pre-wrap
+                                                                ${msg.isMe ? 'bg-[#95ec69] text-black bubble-right' : 'bg-white text-gray-800 bubble-left'}
+                                                                ${msg.isRecalled ? 'recalled-bubble' : ''} 
+                                                            `}>
+                                                                {msg.type === '20001' ? (
+                                                                    <span className={msg.isRecalled ? "line-through text-gray-500" : ""}>
+                                                                        {msg.content}
+                                                                    </span>
+                                                                ) : (
+                                                                    <span className="italic text-gray-500 text-xs">[非文本: {msg.type}]</span>
+                                                                )}
+                                                                {msg.isRecalled && <span className="text-xs text-red-500 ml-1 italic">(已撤回)</span>}
+                                                            </div>
+
+                                                            <span className="text-[10px] text-gray-400 mb-1 flex-shrink-0">
+                                                                {msg.short_time || msg.time.split(' ')[1]}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+
+                                                    {msg.isMe && (
+                                                        <div className="w-9 h-9 rounded bg-gray-200 flex items-center justify-center text-gray-500 ml-3 flex-shrink-0 shadow-sm">
+                                                            <span className="text-xs font-bold">ME</span>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </React.Fragment>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
