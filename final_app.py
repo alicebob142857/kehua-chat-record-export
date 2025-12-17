@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 # ==========================================
-# 1. 前端模板 (包含安全注入修复)
+# 1. 前端模板 (保持不变)
 # ==========================================
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -40,7 +40,6 @@ HTML_TEMPLATE = r"""
 <body>
     <div id="root"></div>
     <script> 
-        /* 安全注入数据，防止昵称包含特殊字符导致页面崩溃 */
         window.INJECTED_DATA = __JSON_DATA_PLACEHOLDER__; 
         window.TARGET_NAME = __TARGET_NAME_JSON__; 
     </script>
@@ -158,54 +157,75 @@ HTML_TEMPLATE = r"""
 # ==========================================
 
 def extract_and_parse_backup(file_path):
+    """
+    解析单个备份文件，返回 (db_path, temp_dir)
+    """
     temp_dir = tempfile.mkdtemp()
     db_path = None
     try:
         ext = os.path.splitext(file_path)[1].lower()
-        if ext == '.db': return file_path, temp_dir
+        if ext == '.db': 
+            db_name = os.path.basename(file_path)
+            dest_path = os.path.join(temp_dir, db_name)
+            shutil.copy2(file_path, dest_path)
+            return dest_path, temp_dir
         
         with open(file_path, 'rb') as f: raw_data = f.read()
 
         marker = b'ANDROID BACKUP'
         start_index = raw_data.find(marker)
-        if start_index == -1 and ext != '.ab': raise Exception("不是有效的 Android 备份文件")
         ab_data = raw_data[start_index:] if start_index != -1 else raw_data
 
         header_end_pos = 0
         newline_count = 0
         for i in range(min(1000, len(ab_data))):
-            if ab_data[i] == 10:
+            if ab_data[i] == 10: 
                 newline_count += 1
                 if newline_count == 4:
                     header_end_pos = i + 1; break
         
         header_lines = ab_data[:header_end_pos].split(b'\n')
-        is_compressed = header_lines[2].strip() == b'1'
-        if header_lines[3].strip() != b'none': raise Exception("备份已加密")
+        if len(header_lines) > 3 and header_lines[3].strip() != b'none':
+            raise Exception("备份文件已加密，无法读取")
+
+        is_compressed = True
+        if len(header_lines) > 2:
+             is_compressed = (header_lines[2].strip() == b'1')
 
         body_data = ab_data[header_end_pos:]
-        tar_stream = zlib.decompress(body_data) if is_compressed else body_data
+        try:
+            tar_stream = zlib.decompress(body_data) if is_compressed else body_data
+        except:
+            tar_stream = body_data
         
         tar_path = os.path.join(temp_dir, 'backup.tar')
         with open(tar_path, 'wb') as f: f.write(tar_stream)
         
         target_suffix = 'apps/com.app.tideswing/db/TideSwing.db'
+        found = False
         with tarfile.open(tar_path, 'r') as tar:
             target_member = None
-            try: target_member = tar.getmember(target_suffix)
+            try: 
+                target_member = tar.getmember(target_suffix)
             except KeyError:
                 for member in tar.getmembers():
-                    if member.name.endswith('TideSwing.db'): target_member = member; break
+                    if member.name.endswith('TideSwing.db'): 
+                        target_member = member; break
+            
             if target_member:
                 tar.extract(target_member, path=temp_dir)
                 db_path = os.path.join(temp_dir, target_member.name)
-            else: raise Exception("未找到 TideSwing.db")
+                found = True
+        
+        if not found:
+             raise Exception("未在备份包中找到 TideSwing.db")
+
         return db_path, temp_dir
     except Exception as e:
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
         raise e
 
-def get_contact_list(db_path):
+def get_contact_list_from_db(db_path):
     contacts = []
     try:
         conn = sqlite3.connect(db_path)
@@ -220,68 +240,92 @@ def get_contact_list(db_path):
                 if k in keys: uid = row[k]; break
             for k in ['nickname', 'NICKNAME', 'name', 'NAME']:
                 if k in keys: name = row[k]; break
-            if uid: contacts.append({"id": uid, "name": name})
+            if uid: contacts.append({"id": str(uid), "name": name}) 
         conn.close()
         return contacts
     except:
         return []
 
-def query_chat_history(db_path, target_peer_id):
+def query_chat_history_from_db(db_path, target_peer_id):
+    """从单个DB查询消息，增加了极强的字段容错处理"""
     messages = []
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # 防御性编程：先检查是否有数据
     try:
-        cursor.execute("SELECT COUNT(*) FROM t_chat_msg WHERE peer_user_id = ?", (target_peer_id,))
-        count = cursor.fetchone()[0]
-        if count == 0:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='t_chat_msg'")
+        if not cursor.fetchone():
             conn.close()
-            return [] 
-    except:
-        conn.close()
-        return []
+            return []
 
-    query = "SELECT * FROM t_chat_msg WHERE peer_user_id = ? ORDER BY create_time ASC"
-    cursor.execute(query, (target_peer_id,))
-    rows = cursor.fetchall()
-    
-    for idx, row in enumerate(rows):
-        keys = row.keys()
-        _id = row['id'] if 'id' in keys else row['_id']
-        content = row['content']
-        create_time = row['create_time']
-        msg_type = row['type']
+        cursor.execute("PRAGMA table_info(t_chat_msg)")
+        columns = [col[1] for col in cursor.fetchall()]
         
-        # =======================================================
-        # 【关键修正】SOURCE = 1 是自己 (右侧)，其他是对方 (左侧)
-        # =======================================================
-        is_me = False
-        if 'source' in keys:
-            is_me = (row['source'] == 1)
-        elif 'SOURCE' in keys:
-            is_me = (row['SOURCE'] == 1)
-        elif 'is_send' in keys:
-            is_me = (row['is_send'] == 1)
+        id_col = None
+        for candidate in ['id', '_id', 'msg_id', 'ID', 'MSG_ID']:
+            if candidate in columns:
+                id_col = candidate; break
+        
+        content_col = 'content' if 'content' in columns else 'CONTENT'
+        
+        time_col = None
+        for candidate in ['create_time', 'CREATE_TIME', 'time', 'TIME', 'timestamp']:
+            if candidate in columns:
+                time_col = candidate; break
+
+        if not id_col or not time_col:
+            conn.close(); return []
+
+        query = f"SELECT * FROM t_chat_msg WHERE peer_user_id = ?"
+        cursor.execute(query, (target_peer_id,))
+        rows = cursor.fetchall()
+        
+        for row in rows:
+            raw_id = row[id_col]
+            msg_id = str(raw_id) if raw_id is not None else f"NOID_{row[time_col]}"
+            content = row[content_col]
+            create_time = row[time_col]
             
-        is_recalled = False
-        if 'recall' in keys: is_recalled = (row['recall'] == 1)
-        
-        try:
-            ts = float(create_time) / 1000.0
-            dt = datetime.datetime.fromtimestamp(ts)
-            full_time, date_str, short_time = dt.strftime('%Y-%m-%d %H:%M:%S'), dt.strftime('%Y-%m-%d'), dt.strftime('%H:%M')
-        except:
-            full_time, date_str, short_time = "Unknown", "1970-01-01", "00:00"
+            msg_type = '1'
+            if 'type' in columns: msg_type = row['type']
+            elif 'TYPE' in columns: msg_type = row['TYPE']
 
-        messages.append({
-            "id": _id, "_originalIndex": idx, "content": content,
-            "time": full_time, "short_time": short_time, "date": date_str,
-            "isMe": is_me, "isRecalled": is_recalled, "type": str(msg_type)
-        })
-    conn.close()
-    return messages
+            is_me = False
+            keys = row.keys()
+            if 'source' in keys: is_me = (row['source'] == 1)
+            elif 'SOURCE' in keys: is_me = (row['SOURCE'] == 1)
+            elif 'is_send' in keys: is_me = (row['is_send'] == 1)
+                
+            is_recalled = False
+            if 'recall' in keys: is_recalled = (row['recall'] == 1)
+            
+            try:
+                ts = float(create_time) / 1000.0
+                dt = datetime.datetime.fromtimestamp(ts)
+                full_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                date_str = dt.strftime('%Y-%m-%d')
+                short_time = dt.strftime('%H:%M')
+            except:
+                full_time, date_str, short_time = "Unknown", "1970-01-01", "00:00"
+                ts = 0
+
+            messages.append({
+                "id": msg_id, 
+                "timestamp": ts, 
+                "content": content,
+                "time": full_time, 
+                "short_time": short_time, 
+                "date": date_str,
+                "isMe": is_me, 
+                "isRecalled": is_recalled, 
+                "type": str(msg_type)
+            })
+        conn.close()
+        return messages
+    except Exception as e:
+        print(f"Error querying db {db_path}: {e}")
+        return []
 
 # ==========================================
 # 3. GUI 主程序
@@ -291,158 +335,364 @@ class AppGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("可话记忆胶囊 - 桌面版")
-        self.root.geometry("500x450")
+        self.root.geometry("600x700") 
         
-        self.db_path = None
-        self.temp_dir = None
-        self.contacts = []
+        # 数据源结构: [{'type': 'db', 'path': ...}, {'type': 'json', 'data': ...}]
+        self.data_sources = [] 
+        self.temp_dirs = []     
+        self.contacts = []      
+        self.current_display_contacts = [] 
         
         style = ttk.Style()
         style.configure("TButton", padding=5)
 
-        # 步骤1：加载
-        frame_top = ttk.LabelFrame(root, text="第一步：加载备份文件", padding=10)
+        # === 第一步：多文件加载区 ===
+        frame_top = ttk.LabelFrame(root, text="第一步：导入文件 (.ab / .bak / .db / .json)", padding=10)
         frame_top.pack(fill="x", padx=10, pady=5)
         
-        self.file_path = tk.StringVar()
-        ttk.Entry(frame_top, textvariable=self.file_path).pack(side="left", fill="x", expand=True, padx=(0,5))
-        ttk.Button(frame_top, text="浏览", command=self.browse_file).pack(side="right")
-        self.btn_load = ttk.Button(frame_top, text="解析并加载联系人", command=self.do_load_process)
-        self.btn_load.pack(side="bottom", fill="x", pady=(5,0))
+        self.file_listbox = tk.Listbox(frame_top, height=4, font=("Arial", 9), fg="#555")
+        self.file_listbox.pack(side="left", fill="both", expand=True, padx=(0,5))
+        
+        btn_frame = ttk.Frame(frame_top)
+        btn_frame.pack(side="right", fill="y")
+        
+        ttk.Button(btn_frame, text="➕ 添加文件", command=self.add_files).pack(fill="x", pady=(0,5))
+        ttk.Button(btn_frame, text="🗑️ 清空列表", command=self.clear_files).pack(fill="x", pady=(0,5))
+        self.btn_analyze = ttk.Button(btn_frame, text="🚀 开始解析", command=self.do_analyze_process, state="disabled")
+        self.btn_analyze.pack(fill="x", side="bottom")
 
-        # 步骤2：选择
-        frame_mid = ttk.LabelFrame(root, text="第二步：选择聊天对象", padding=10)
-        frame_mid.pack(fill="x", padx=10, pady=5)
+        # === 第二步：选择聊天对象 ===
+        frame_mid = ttk.LabelFrame(root, text="第二步：选择聊天对象 (自动合并)", padding=10)
+        frame_mid.pack(fill="both", expand=True, padx=10, pady=5)
         
         self.search_var = tk.StringVar()
         self.search_var.trace("w", self.filter_contacts)
-        ttk.Label(frame_mid, text="搜索昵称:", font=("Arial", 9), foreground="gray").pack(anchor="w")
-        self.entry_search = ttk.Entry(frame_mid, textvariable=self.search_var, state="disabled")
-        self.entry_search.pack(fill="x", pady=(0, 5))
         
-        self.combo_var = tk.StringVar()
-        self.combo = ttk.Combobox(frame_mid, textvariable=self.combo_var, state="disabled")
-        self.combo.pack(fill="x", pady=5)
-        self.combo.bind("<<ComboboxSelected>>", self.on_select_change)
+        search_frame = ttk.Frame(frame_mid)
+        search_frame.pack(fill="x", pady=(0, 5))
+        ttk.Label(search_frame, text="🔍 搜索昵称:", font=("Arial", 9)).pack(side="left")
+        self.entry_search = ttk.Entry(search_frame, textvariable=self.search_var, state="disabled")
+        self.entry_search.pack(side="left", fill="x", expand=True, padx=(5,0))
+        
+        list_frame = ttk.Frame(frame_mid)
+        list_frame.pack(fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.contact_listbox = tk.Listbox(list_frame, height=10, selectmode="single", 
+                                  exportselection=False, yscrollcommand=scrollbar.set,
+                                  font=("Arial", 10))
+        self.contact_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.contact_listbox.yview)
+        self.contact_listbox.bind("<<ListboxSelect>>", self.on_select_change)
 
-        # 步骤3：生成
-        self.btn_gen = ttk.Button(root, text="生成聊天记录页面 (保存至桌面)", command=self.do_generate, state="disabled")
-        self.btn_gen.pack(pady=20, ipadx=20, ipady=5)
+        # === 第三步：功能区 ===
+        frame_action = ttk.Frame(root)
+        frame_action.pack(pady=10, fill="x", padx=20)
         
-        self.lbl_status = ttk.Label(root, text="就绪", foreground="gray")
+        # 复选框：是否保存 JSON
+        self.save_json_var = tk.BooleanVar(value=False)
+        chk_json = ttk.Checkbutton(frame_action, text="同时导出合并后的 JSON 数据 (.json)", variable=self.save_json_var)
+        chk_json.pack(anchor="w", pady=(0, 5))
+        
+        btn_box = ttk.Frame(frame_action)
+        btn_box.pack(fill="x")
+
+        self.btn_preview = ttk.Button(btn_box, text="👀 立即查看", command=self.do_preview, state="disabled")
+        self.btn_preview.pack(side="left", fill="x", expand=True, padx=(0, 5), ipady=5)
+
+        self.btn_export = ttk.Button(btn_box, text="💾 导出 HTML...", command=self.do_export, state="disabled")
+        self.btn_export.pack(side="right", fill="x", expand=True, padx=(5, 0), ipady=5)
+        
+        # 进度条
+        self.progress = ttk.Progressbar(root, orient="horizontal", mode="determinate")
+        self.progress.pack(fill="x", padx=20, pady=(10, 0))
+
+        self.lbl_status = ttk.Label(root, text="请先添加备份文件", foreground="gray")
         self.lbl_status.pack(side="bottom", pady=10)
 
-    def browse_file(self):
-        f = filedialog.askopenfilename(filetypes=[("Backup", "*.bak *.ab *.db")])
-        if f: self.file_path.set(f)
+    def add_files(self):
+        files = filedialog.askopenfilenames(filetypes=[("Backup/JSON", "*.bak *.ab *.db *.json")])
+        if not files: return
+        
+        count_added = 0
+        for f in files:
+            if f not in self.file_listbox.get(0, tk.END):
+                self.file_listbox.insert(tk.END, f)
+                count_added += 1
+        
+        if self.file_listbox.size() > 0:
+            self.btn_analyze.config(state="normal")
+            self.lbl_status.config(text=f"已准备 {self.file_listbox.size()} 个文件，点击“开始解析”", foreground="blue")
 
-    def do_load_process(self):
-        f_path = self.file_path.get().strip()
-        if not f_path or not os.path.exists(f_path):
-            messagebox.showerror("错误", "文件无效")
-            return
-            
-        self.lbl_status.config(text="处理中，请稍候...", foreground="orange")
+    def clear_files(self):
+        self.file_listbox.delete(0, tk.END)
+        self.btn_analyze.config(state="disabled")
+        self.cleanup_temps()
+        self.data_sources = []
+        self.contacts = []
+        self.update_contact_listbox([])
+        self.lbl_status.config(text="列表已清空")
+        self.progress['value'] = 0
+
+    def do_analyze_process(self):
+        raw_files = self.file_listbox.get(0, tk.END)
+        if not raw_files: return
+        
+        self.lbl_status.config(text="正在解析文件...", foreground="orange")
+        self.progress['value'] = 0
+        self.progress['maximum'] = len(raw_files)
         self.root.update()
         
-        try:
-            if self.temp_dir and os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir)
-            
-            self.db_path, self.temp_dir = extract_and_parse_backup(f_path)
-            self.contacts = get_contact_list(self.db_path)
-            
-            if not self.contacts:
-                messagebox.showwarning("提示", "未找到联系人数据")
-                return
+        self.cleanup_temps()
+        self.data_sources = []
+        
+        valid_count = 0
+        merged_contacts_dict = {}
 
-            self.update_combo_list(self.contacts)
-            self.combo.config(state="readonly")
-            self.entry_search.config(state="normal")
-            self.lbl_status.config(text=f"加载成功，共 {len(self.contacts)} 人", foreground="green")
-            
-        except Exception as e:
-            messagebox.showerror("错误", str(e))
-            self.lbl_status.config(text="出错", foreground="red")
+        for i, f_path in enumerate(raw_files):
+            try:
+                ext = os.path.splitext(f_path)[1].lower()
+                
+                # 情况 A: JSON 文件 (已处理过的数据)
+                if ext == '.json':
+                    with open(f_path, 'r', encoding='utf-8') as jf:
+                        j_data = json.load(jf)
+                        # 识别格式：新版带meta，旧版纯list
+                        if isinstance(j_data, dict) and 'meta' in j_data:
+                            # 提取联系人
+                            meta = j_data['meta']
+                            merged_contacts_dict[meta['id']] = {'id': meta['id'], 'name': meta['name']}
+                            self.data_sources.append({'type': 'json', 'data': j_data})
+                            valid_count += 1
+                        else:
+                            print(f"Skipping incompatible JSON: {f_path}")
 
-    def update_combo_list(self, contact_list):
-        display_list = [f"{c['name']} ({c['id'][:6]}...)" for c in contact_list]
-        self.combo['values'] = display_list
-        if display_list: 
-            self.combo.current(0)
-            self.on_select_change(None)
+                # 情况 B: DB/Backup 文件
+                else:
+                    db_path, temp_dir = extract_and_parse_backup(f_path)
+                    self.temp_dirs.append(temp_dir)
+                    self.data_sources.append({'type': 'db', 'path': db_path})
+                    
+                    # 从 DB 提取联系人
+                    c_list = get_contact_list_from_db(db_path)
+                    for c in c_list:
+                        merged_contacts_dict[c['id']] = c
+                    valid_count += 1
+            
+            except Exception as e:
+                print(f"File Error: {f_path} -> {e}")
+
+            # 更新进度条
+            self.progress['value'] = i + 1
+            self.root.update()
+        
+        self.contacts = list(merged_contacts_dict.values())
+        
+        if valid_count == 0:
+            messagebox.showerror("错误", "所有文件均解析失败。")
+            self.lbl_status.config(text="解析失败", foreground="red")
+            return
+        
+        if not self.contacts:
+             self.lbl_status.config(text="解析成功，但未发现联系人", foreground="orange")
+             return
+
+        self.update_contact_listbox(self.contacts)
+        self.entry_search.config(state="normal")
+        self.lbl_status.config(text=f"加载完成，共 {valid_count} 个有效源，{len(self.contacts)} 位联系人", foreground="green")
+
+    def update_contact_listbox(self, contact_list):
+        self.contact_listbox.delete(0, tk.END)
+        self.current_display_contacts = contact_list
+        for c in contact_list:
+            display_text = c['name']
+            self.contact_listbox.insert(tk.END, display_text)
 
     def filter_contacts(self, *args):
         keyword = self.search_var.get().lower()
         if not keyword: 
-            self.update_combo_list(self.contacts)
+            self.update_contact_listbox(self.contacts)
             return
-        filtered = [c for c in self.contacts if keyword in c['name'].lower() or keyword in c['id'].lower()]
-        self.update_combo_list(filtered)
+        filtered = [c for c in self.contacts if keyword in c['name'].lower()]
+        self.update_contact_listbox(filtered)
 
     def on_select_change(self, event):
-        self.btn_gen.config(state="normal")
+        selection = self.contact_listbox.curselection()
+        if selection:
+            self.btn_preview.config(state="normal")
+            self.btn_export.config(state="normal")
+        else:
+            self.btn_preview.config(state="disabled")
+            self.btn_export.config(state="disabled")
 
-    def do_generate(self):
-        current_display = self.combo.get()
-        target_contact = None
-        for c in self.contacts:
-            if f"{c['name']} ({c['id'][:6]}...)" == current_display:
-                target_contact = c
-                break
+    def get_merged_messages(self, target_id):
+        all_raw_messages = []
         
-        if not target_contact: return
+        # 1. 收集所有数据源的消息
+        # 设置进度条：每个源算一步
+        self.progress['value'] = 0
+        self.progress['maximum'] = len(self.data_sources) + 1 # +1 for dedupe
         
+        for i, src in enumerate(self.data_sources):
+            if src['type'] == 'db':
+                msgs = query_chat_history_from_db(src['path'], target_id)
+                all_raw_messages.extend(msgs)
+            elif src['type'] == 'json':
+                meta = src['data'].get('meta', {})
+                # 只有当 JSON 里的 target_id 匹配时才加入
+                if meta.get('id') == target_id:
+                    all_raw_messages.extend(src['data'].get('messages', []))
+            
+            self.progress['value'] = i + 1
+            self.root.update()
+
+        # 2. 单文件保护：如果只有1个源，直接返回，不去重
+        if len(self.data_sources) == 1:
+            all_raw_messages.sort(key=lambda x: x['timestamp'])
+            for i, m in enumerate(all_raw_messages): m['_originalIndex'] = i
+            return all_raw_messages
+
+        # 3. 多文件去重逻辑
+        # 第一层：ID 去重 (字典覆盖)
+        id_map = {}
+        for m in all_raw_messages:
+            id_map[str(m['id'])] = m
+        
+        merged_list = list(id_map.values())
+        merged_list.sort(key=lambda x: x['timestamp']) # 按时间排序准备进行指纹对比
+        
+        # 第二层：指纹去重 (Same Time + Same Content)
+        final_unique_msgs = []
+        
+        if merged_list:
+            final_unique_msgs.append(merged_list[0])
+            for i in range(1, len(merged_list)):
+                curr = merged_list[i]
+                prev = final_unique_msgs[-1]
+                
+                # 判定重合：时间戳相同 (忽略毫秒差异) AND 内容完全一致
+                time_match = abs(curr['timestamp'] - prev['timestamp']) < 0.001
+                content_match = (curr['content'] == prev['content'])
+                
+                if time_match and content_match:
+                    continue # 跳过，认为是重复
+                
+                final_unique_msgs.append(curr)
+
+        # 重建索引
+        for i, m in enumerate(final_unique_msgs):
+            m['_originalIndex'] = i
+            
+        self.progress['value'] = self.progress['maximum']
+        self.root.update()
+        
+        return final_unique_msgs
+
+    def generate_html_and_json(self, target_contact):
         target_id = target_contact['id']
         target_name = target_contact['name']
+        
+        messages = self.get_merged_messages(target_id)
+        if not messages: return None, None, None
 
-        self.lbl_status.config(text=f"正在提取: {target_name}...", foreground="blue")
-        self.root.update()
+        # 准备 HTML 数据
+        json_str = json.dumps(messages, ensure_ascii=False)
+        name_json = json.dumps(target_name, ensure_ascii=False)
+        html_content = HTML_TEMPLATE.replace("__JSON_DATA_PLACEHOLDER__", json_str)
+        html_content = html_content.replace("__TARGET_NAME_JSON__", name_json)
+
+        # 准备 JSON 数据 (带 Meta 头的格式)
+        json_data_full = {
+            "meta": {
+                "id": target_id,
+                "name": target_name,
+                "export_date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            },
+            "messages": messages
+        }
+
+        return html_content, json_data_full, len(messages)
+
+    def do_preview(self):
+        selection = self.contact_listbox.curselection()
+        if not selection: return
+        
+        index = selection[0]
+        contact = self.current_display_contacts[index]
+        self.lbl_status.config(text="正在合并数据...", foreground="blue")
 
         try:
-            messages = query_chat_history(self.db_path, target_id)
-            
-            if not messages or len(messages) == 0:
-                messagebox.showinfo("无记录", f"与 {target_name} 没有聊天记录。")
+            html, _, count = self.generate_html_and_json(contact)
+            if not html:
+                messagebox.showinfo("提示", "无记录")
                 self.lbl_status.config(text="无记录", foreground="gray")
-                return 
+                return
 
-            # 生成 HTML 内容
-            json_str = json.dumps(messages, ensure_ascii=False)
-            name_json = json.dumps(target_name, ensure_ascii=False)
+            temp_path = os.path.join(tempfile.gettempdir(), "kehua_preview.html")
+            with open(temp_path, 'w', encoding='utf-8') as f: f.write(html)
             
-            html_content = HTML_TEMPLATE.replace("__JSON_DATA_PLACEHOLDER__", json_str)
-            html_content = html_content.replace("__TARGET_NAME_JSON__", name_json)
-            
-            # ========================================================
-            # 【关键修复】强制保存到桌面，解决 Read-only 报错
-            # ========================================================
-            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-            
-            # 【关键修复】文件名只用安全的 ID，避免非法字符报错
-            safe_filename = f"chat_{target_id[:8]}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.html"
-            out_path = os.path.join(desktop_path, safe_filename)
-            
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-                
-            self.lbl_status.config(text="已保存到桌面！", foreground="green")
-            
-            if os.path.exists(out_path):
-                webbrowser.open('file://' + out_path)
-            else:
-                messagebox.showerror("错误", "文件生成失败，路径不存在")
-            
+            webbrowser.open('file://' + temp_path)
+            self.lbl_status.config(text=f"预览已打开 (共 {count} 条)", foreground="green")
+
         except Exception as e:
-            messagebox.showerror("失败", str(e))
+            messagebox.showerror("错误", str(e))
+
+    def do_export(self):
+        selection = self.contact_listbox.curselection()
+        if not selection: return
+        
+        index = selection[0]
+        contact = self.current_display_contacts[index]
+        
+        # 询问保存路径 (默认 HTML)
+        default_name = f"可话_{contact['name']}_{datetime.datetime.now().strftime('%Y%m%d')}.html"
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML Files", "*.html")],
+            initialfile=default_name,
+            title="导出聊天记录"
+        )
+        if not save_path: return
+
+        self.lbl_status.config(text="正在导出...", foreground="blue")
+        try:
+            html, json_data, count = self.generate_html_and_json(contact)
+            
+            if not html:
+                messagebox.showinfo("提示", "无记录")
+                return
+
+            # 1. 保存 HTML
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(html)
+            
+            msg = f"已导出 HTML 至: {save_path}"
+
+            # 2. 如果勾选，保存 JSON
+            if self.save_json_var.get():
+                json_path = os.path.splitext(save_path)[0] + ".json"
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                msg += f"\n及 JSON 至: {json_path}"
+
+            self.lbl_status.config(text=f"导出成功 ({count} 条)", foreground="green")
+            messagebox.showinfo("成功", msg)
+
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def cleanup_temps(self):
+        for d in self.temp_dirs:
+            if os.path.exists(d):
+                try: shutil.rmtree(d)
+                except: pass
+        self.temp_dirs = []
 
     def __del__(self):
-        if self.temp_dir and os.path.exists(self.temp_dir):
-            try: shutil.rmtree(self.temp_dir)
-            except: pass
+        self.cleanup_temps()
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = AppGUI(root)
     root.mainloop()
-    
