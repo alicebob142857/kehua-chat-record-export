@@ -335,9 +335,8 @@ class AppGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("可话记忆胶囊 - 桌面版")
-        self.root.geometry("600x700") 
+        self.root.geometry("600x750") # 稍微调高一点高度，容纳顶部链接
         
-        # 数据源结构: [{'type': 'db', 'path': ...}, {'type': 'json', 'data': ...}]
         self.data_sources = [] 
         self.temp_dirs = []     
         self.contacts = []      
@@ -345,6 +344,26 @@ class AppGUI:
         
         style = ttk.Style()
         style.configure("TButton", padding=5)
+        
+        # === 顶部：开源项目链接 ===
+        frame_header = ttk.Frame(root)
+        frame_header.pack(fill="x", padx=10, pady=10)
+        
+        lbl_title = ttk.Label(frame_header, text="✨ 如果觉得好用，请给个 Star 支持一下作者！", font=("Arial", 10, "bold"), foreground="#FF9800")
+        lbl_title.pack(side="top", pady=(0, 5))
+
+        link_frame = ttk.Frame(frame_header)
+        link_frame.pack(side="top")
+
+        # GitHub 链接
+        lbl_github = tk.Label(link_frame, text="[GitHub]", font=("Arial", 9, "underline"), fg="blue", cursor="hand2")
+        lbl_github.pack(side="left", padx=10)
+        lbl_github.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/alicebob142857/kehua-chat-record-export"))
+        
+        # Gitee 链接
+        lbl_gitee = tk.Label(link_frame, text="[Gitee]", font=("Arial", 9, "underline"), fg="red", cursor="hand2")
+        lbl_gitee.pack(side="left", padx=10)
+        lbl_gitee.bind("<Button-1>", lambda e: webbrowser.open("https://gitee.com/alicebob142857/kehua"))
 
         # === 第一步：多文件加载区 ===
         frame_top = ttk.LabelFrame(root, text="第一步：导入文件 (.ab / .bak / .db / .json)", padding=10)
@@ -390,7 +409,6 @@ class AppGUI:
         frame_action = ttk.Frame(root)
         frame_action.pack(pady=10, fill="x", padx=20)
         
-        # 复选框：是否保存 JSON
         self.save_json_var = tk.BooleanVar(value=False)
         chk_json = ttk.Checkbutton(frame_action, text="同时导出合并后的 JSON 数据 (.json)", variable=self.save_json_var)
         chk_json.pack(anchor="w", pady=(0, 5))
@@ -404,13 +422,13 @@ class AppGUI:
         self.btn_export = ttk.Button(btn_box, text="💾 导出 HTML...", command=self.do_export, state="disabled")
         self.btn_export.pack(side="right", fill="x", expand=True, padx=(5, 0), ipady=5)
         
-        # 进度条
         self.progress = ttk.Progressbar(root, orient="horizontal", mode="determinate")
         self.progress.pack(fill="x", padx=20, pady=(10, 0))
 
         self.lbl_status = ttk.Label(root, text="请先添加备份文件", foreground="gray")
         self.lbl_status.pack(side="bottom", pady=10)
 
+    # ... (后面的 add_files, do_analyze_process 等所有方法完全保持不变，复制粘贴即可) ...
     def add_files(self):
         files = filedialog.askopenfilenames(filetypes=[("Backup/JSON", "*.bak *.ab *.db *.json")])
         if not files: return
@@ -454,13 +472,10 @@ class AppGUI:
             try:
                 ext = os.path.splitext(f_path)[1].lower()
                 
-                # 情况 A: JSON 文件 (已处理过的数据)
                 if ext == '.json':
                     with open(f_path, 'r', encoding='utf-8') as jf:
                         j_data = json.load(jf)
-                        # 识别格式：新版带meta，旧版纯list
                         if isinstance(j_data, dict) and 'meta' in j_data:
-                            # 提取联系人
                             meta = j_data['meta']
                             merged_contacts_dict[meta['id']] = {'id': meta['id'], 'name': meta['name']}
                             self.data_sources.append({'type': 'json', 'data': j_data})
@@ -468,13 +483,11 @@ class AppGUI:
                         else:
                             print(f"Skipping incompatible JSON: {f_path}")
 
-                # 情况 B: DB/Backup 文件
                 else:
                     db_path, temp_dir = extract_and_parse_backup(f_path)
                     self.temp_dirs.append(temp_dir)
                     self.data_sources.append({'type': 'db', 'path': db_path})
                     
-                    # 从 DB 提取联系人
                     c_list = get_contact_list_from_db(db_path)
                     for c in c_list:
                         merged_contacts_dict[c['id']] = c
@@ -483,7 +496,6 @@ class AppGUI:
             except Exception as e:
                 print(f"File Error: {f_path} -> {e}")
 
-            # 更新进度条
             self.progress['value'] = i + 1
             self.root.update()
         
@@ -529,10 +541,8 @@ class AppGUI:
     def get_merged_messages(self, target_id):
         all_raw_messages = []
         
-        # 1. 收集所有数据源的消息
-        # 设置进度条：每个源算一步
         self.progress['value'] = 0
-        self.progress['maximum'] = len(self.data_sources) + 1 # +1 for dedupe
+        self.progress['maximum'] = len(self.data_sources) + 1 
         
         for i, src in enumerate(self.data_sources):
             if src['type'] == 'db':
@@ -540,47 +550,39 @@ class AppGUI:
                 all_raw_messages.extend(msgs)
             elif src['type'] == 'json':
                 meta = src['data'].get('meta', {})
-                # 只有当 JSON 里的 target_id 匹配时才加入
                 if meta.get('id') == target_id:
                     all_raw_messages.extend(src['data'].get('messages', []))
             
             self.progress['value'] = i + 1
             self.root.update()
 
-        # 2. 单文件保护：如果只有1个源，直接返回，不去重
         if len(self.data_sources) == 1:
             all_raw_messages.sort(key=lambda x: x['timestamp'])
             for i, m in enumerate(all_raw_messages): m['_originalIndex'] = i
             return all_raw_messages
 
-        # 3. 多文件去重逻辑
-        # 第一层：ID 去重 (字典覆盖)
         id_map = {}
         for m in all_raw_messages:
             id_map[str(m['id'])] = m
         
         merged_list = list(id_map.values())
-        merged_list.sort(key=lambda x: x['timestamp']) # 按时间排序准备进行指纹对比
+        merged_list.sort(key=lambda x: x['timestamp']) 
         
-        # 第二层：指纹去重 (Same Time + Same Content)
         final_unique_msgs = []
-        
         if merged_list:
             final_unique_msgs.append(merged_list[0])
             for i in range(1, len(merged_list)):
                 curr = merged_list[i]
                 prev = final_unique_msgs[-1]
                 
-                # 判定重合：时间戳相同 (忽略毫秒差异) AND 内容完全一致
                 time_match = abs(curr['timestamp'] - prev['timestamp']) < 0.001
                 content_match = (curr['content'] == prev['content'])
                 
                 if time_match and content_match:
-                    continue # 跳过，认为是重复
+                    continue
                 
                 final_unique_msgs.append(curr)
 
-        # 重建索引
         for i, m in enumerate(final_unique_msgs):
             m['_originalIndex'] = i
             
@@ -596,13 +598,11 @@ class AppGUI:
         messages = self.get_merged_messages(target_id)
         if not messages: return None, None, None
 
-        # 准备 HTML 数据
         json_str = json.dumps(messages, ensure_ascii=False)
         name_json = json.dumps(target_name, ensure_ascii=False)
         html_content = HTML_TEMPLATE.replace("__JSON_DATA_PLACEHOLDER__", json_str)
         html_content = html_content.replace("__TARGET_NAME_JSON__", name_json)
 
-        # 准备 JSON 数据 (带 Meta 头的格式)
         json_data_full = {
             "meta": {
                 "id": target_id,
@@ -645,7 +645,6 @@ class AppGUI:
         index = selection[0]
         contact = self.current_display_contacts[index]
         
-        # 询问保存路径 (默认 HTML)
         default_name = f"可话_{contact['name']}_{datetime.datetime.now().strftime('%Y%m%d')}.html"
         save_path = filedialog.asksaveasfilename(
             defaultextension=".html",
@@ -663,13 +662,11 @@ class AppGUI:
                 messagebox.showinfo("提示", "无记录")
                 return
 
-            # 1. 保存 HTML
             with open(save_path, 'w', encoding='utf-8') as f:
                 f.write(html)
             
             msg = f"已导出 HTML 至: {save_path}"
 
-            # 2. 如果勾选，保存 JSON
             if self.save_json_var.get():
                 json_path = os.path.splitext(save_path)[0] + ".json"
                 with open(json_path, 'w', encoding='utf-8') as f:
